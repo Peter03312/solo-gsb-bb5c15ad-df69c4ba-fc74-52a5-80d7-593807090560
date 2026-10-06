@@ -2,8 +2,11 @@
 
 所有校验在写库事务开启之前完成，错误以 :class:`ValidationError` 抛出，
 调用方负责返回 400 并保留数据库旧版本。
+
+联合预检（:func:`precheck_import`）复用完全相同的校验规则，但以
+"收集全部可判定错误"的方式返回结构化报告，且全程不触碰数据库。
 """
-from typing import Any
+from typing import Any, Optional
 
 from .timeutil import TimeError, parse_time
 
@@ -42,44 +45,193 @@ def _validate_stairs(value: Any) -> bool:
     return value
 
 
-def _normalize_reverse_windows(raw: Any, where: str) -> list[tuple[int, int]]:
-    """校验一条路段上的反向通行时间窗数组。
+def _collect_reverse_window_errors(
+    raw: Any, where: str
+) -> tuple[list[dict], list[tuple[int, int]]]:
+    """收集一条路段上反向通行时间窗数组的全部错误（不抛异常）。
 
     每项 ``{"start": ..., "end": ...}`` 使用既有时间格式，区间为半开
     ``[start, end)`` 且必须 ``start < end``。窗内仅允许从原终点走向原起点，
     窗外仅允许原方向。同一数组内的时间窗不得重叠（端点相接允许）。
-    返回按开始时刻排序的 ``(start, end)`` 纪元秒元组列表。
+
+    返回 ``(errors, windows)``：``errors`` 为 ``[{"path", "message"}]``；
+    ``windows`` 为解析成功、按开始时刻排序的 ``(start, end)`` 纪元秒列表。
+    重叠检查在合法窗子集上进行（非法窗的错误在先，不影响首错误语义）。
     """
+    errors: list[dict] = []
     if not isinstance(raw, list):
-        raise ValidationError(f"{where}.reverse_windows 必须是数组")
+        errors.append(
+            {"path": f"{where}.reverse_windows",
+             "message": f"{where}.reverse_windows 必须是数组"}
+        )
+        return errors, []
+
     windows: list[tuple[int, int]] = []
     for j, item in enumerate(raw):
         wwhere = f"{where}.reverse_windows[{j}]"
         if not isinstance(item, dict):
-            raise ValidationError(f"{wwhere} 必须是对象")
+            errors.append({"path": wwhere, "message": f"{wwhere} 必须是对象"})
+            continue
+        item_ok = True
         if "start" not in item:
-            raise ValidationError(f"{wwhere} 缺少 start")
+            errors.append({"path": wwhere, "message": f"{wwhere} 缺少 start"})
+            item_ok = False
         if "end" not in item:
-            raise ValidationError(f"{wwhere} 缺少 end")
+            errors.append({"path": wwhere, "message": f"{wwhere} 缺少 end"})
+            item_ok = False
+        if not item_ok:
+            continue
         try:
             start = parse_time(item["start"])
             end = parse_time(item["end"])
         except TimeError as exc:
-            raise ValidationError(f"{wwhere}: {exc}") from None
+            errors.append({"path": wwhere, "message": f"{wwhere}: {exc}"})
+            continue
         if start >= end:
-            raise ValidationError(
-                f"{wwhere} 无效时间窗: start({item['start']}) 必须早于 end({item['end']})"
+            errors.append(
+                {"path": wwhere,
+                 "message": f"{wwhere} 无效时间窗: start({item['start']}) "
+                            f"必须早于 end({item['end']})"}
             )
+            continue
         windows.append((start, end))
 
     windows.sort()
     for (s1, e1), (s2, e2) in zip(windows, windows[1:]):
         if e1 > s2:
-            raise ValidationError(
-                f"{where} 的反向时间窗存在重叠（半开区间仅允许端点相接）: "
-                f"[{s1}, {e1}) 与 [{s2}, {e2}) 重叠"
+            errors.append(
+                {"path": f"{where}.reverse_windows",
+                 "message": f"{where} 的反向时间窗存在重叠（半开区间仅允许端点相接）: "
+                            f"[{s1}, {e1}) 与 [{s2}, {e2}) 重叠"}
             )
-    return windows
+    return errors, windows
+
+
+def collect_graph_errors(payload: Any) -> tuple[list[dict], Optional[dict]]:
+    """收集候选步道图负载的全部可判定错误（不抛异常）。
+
+    校验规则、错误消息与发现顺序同 :func:`normalize_graph` 完全一致，
+    区别仅在出错时不抛出、继续向后收集。返回 ``(errors, graph)``：
+    ``errors`` 为 ``[{"path", "message"}]``（``path`` 含原数组位置，如
+    ``edges[1].travel_seconds``）；全部通过时 ``graph`` 为规范化结构，
+    否则为 ``None``。
+
+    ``nodes`` 本身不是数组时，节点集合不可判定，边的节点引用检查跳过
+    （仅报告 ``nodes`` 错误），避免级联误报。
+    """
+    errors: list[dict] = []
+
+    def err(path: str, message: str) -> None:
+        errors.append({"path": path, "message": message})
+
+    if not isinstance(payload, dict):
+        err("graph", "步道图必须是 JSON 对象")
+        return errors, None
+
+    raw_nodes = payload.get("nodes")
+    raw_edges = payload.get("edges")
+    nodes_declared = isinstance(raw_nodes, list)
+    if not nodes_declared:
+        err("nodes", "nodes 必须是数组")
+        raw_nodes = []
+    if not isinstance(raw_edges, list):
+        err("edges", "edges 必须是数组")
+        raw_edges = []
+
+    nodes: list[str] = []
+    node_set: set[str] = set()
+    for i, raw in enumerate(raw_nodes):
+        try:
+            node = _clean_identifier(raw, f"nodes[{i}]")
+        except ValidationError as exc:
+            err(f"nodes[{i}]", str(exc))
+            continue
+        if node in node_set:
+            err(f"nodes[{i}]", f"节点重复: {node!r}")
+            continue
+        node_set.add(node)
+        nodes.append(node)
+
+    edges: list[dict] = []
+    edge_ids: set[str] = set()
+    for i, raw in enumerate(raw_edges):
+        where = f"edges[{i}]"
+        if not isinstance(raw, dict):
+            err(where, f"{where} 必须是对象")
+            continue
+        edge_ok = True
+
+        edge_id: Optional[str] = None
+        try:
+            edge_id = _clean_identifier(raw.get("id"), f"{where}.id")
+        except ValidationError as exc:
+            err(f"{where}.id", str(exc))
+            edge_ok = False
+        else:
+            if edge_id in edge_ids:
+                err(f"{where}.id", f"路段编号重复: {edge_id!r}")
+                edge_ok = False
+            else:
+                edge_ids.add(edge_id)
+
+        endpoints: dict[str, str] = {}
+        for field in ("from", "to"):
+            try:
+                endpoints[field] = _clean_identifier(raw.get(field), f"{where}.{field}")
+            except ValidationError as exc:
+                err(f"{where}.{field}", str(exc))
+                edge_ok = False
+        # 节点引用仅在 nodes 数组合法、且两端标识均可用时才可判定
+        if nodes_declared and len(endpoints) == 2:
+            unknown = [n for n in (endpoints["from"], endpoints["to"]) if n not in node_set]
+            if unknown:
+                err(where, f"{where} 引用了未定义的节点: {', '.join(unknown)}")
+                edge_ok = False
+
+        seconds: Optional[int] = None
+        if "travel_seconds" not in raw:
+            err(f"{where}.travel_seconds", f"{where} 缺少 travel_seconds")
+            edge_ok = False
+        else:
+            try:
+                seconds = _validate_seconds(raw["travel_seconds"])
+            except ValidationError as exc:
+                err(f"{where}.travel_seconds", str(exc))
+                edge_ok = False
+
+        has_stairs = False
+        try:
+            has_stairs = _validate_stairs(raw.get("has_stairs", False))
+        except ValidationError as exc:
+            err(f"{where}.has_stairs", str(exc))
+            edge_ok = False
+
+        # 反向通行时间窗：缺省（None）与空数组都表示全程仅允许原方向
+        reverse_windows: list[tuple[int, int]] = []
+        if "reverse_windows" in raw and raw["reverse_windows"] is not None:
+            window_errors, reverse_windows = _collect_reverse_window_errors(
+                raw["reverse_windows"], where
+            )
+            errors.extend(window_errors)
+            if window_errors:
+                edge_ok = False
+
+        if edge_ok:
+            edges.append(
+                {
+                    "id": edge_id,
+                    "src": endpoints["from"],
+                    "dst": endpoints["to"],
+                    "seconds": seconds,
+                    "has_stairs": has_stairs,
+                    "reverse_windows": reverse_windows,
+                }
+            )
+
+    if errors:
+        return errors, None
+    # 允许空图；允许自环（正秒数下不会被最短路采用）
+    return [], {"nodes": nodes, "edges": edges}
 
 
 def normalize_graph(payload: Any) -> dict:
@@ -101,66 +253,84 @@ def normalize_graph(payload: Any) -> dict:
 
     每条边可选 ``reverse_windows``：半开 ``[start, end)`` 时间窗数组，
     窗内仅允许从 ``to`` 反向走向 ``from``；缺省或为空时行为不变。
+    首个校验错误以 :class:`ValidationError` 抛出。
     """
-    data = _require_object(payload, "步道图")
-    raw_nodes = data.get("nodes")
-    raw_edges = data.get("edges")
-    if not isinstance(raw_nodes, list):
-        raise ValidationError("nodes 必须是数组")
-    if not isinstance(raw_edges, list):
-        raise ValidationError("edges 必须是数组")
+    errors, graph = collect_graph_errors(payload)
+    if errors:
+        raise ValidationError(errors[0]["message"])
+    return graph
 
-    nodes: list[str] = []
-    node_set: set[str] = set()
-    for i, raw in enumerate(raw_nodes):
-        node = _clean_identifier(raw, f"nodes[{i}]")
-        if node in node_set:
-            raise ValidationError(f"节点重复: {node!r}")
-        node_set.add(node)
-        nodes.append(node)
 
-    edges: list[dict] = []
-    edge_ids: set[str] = set()
-    for i, raw in enumerate(raw_edges):
+def collect_closure_errors(
+    raw_closures: Any, known_edges: Optional[set]
+) -> tuple[list[dict], Optional[list]]:
+    """收集封闭记录数组的全部可判定错误（不抛异常）。
+
+    ``raw_closures`` 为封闭记录数组（即 ``{"closures": [...]}`` 中的数组
+    部分）。``known_edges`` 为可用于校验 ``edge_id`` 引用的路段编号集合；
+    传 ``None`` 表示引用关系不可判定（例如联合预检中候选图本身无效），
+    此时跳过引用检查、绝不误报，其余字段与时间区间校验照常。
+
+    返回 ``(errors, closures)``：全部通过时 ``closures`` 为规范化列表，
+    否则为 ``None``。校验规则与 :func:`normalize_closures` 完全一致。
+    """
+    errors: list[dict] = []
+    if not isinstance(raw_closures, list):
+        errors.append({"path": "closures", "message": "closures 必须是数组"})
+        return errors, None
+
+    closures: list[dict] = []
+    for i, raw in enumerate(raw_closures):
+        where = f"closures[{i}]"
         if not isinstance(raw, dict):
-            raise ValidationError(f"edges[{i}] 必须是对象")
-        where = f"edges[{i}]"
-        edge_id = _clean_identifier(raw.get("id"), f"{where}.id")
-        if edge_id in edge_ids:
-            raise ValidationError(f"路段编号重复: {edge_id!r}")
-        edge_ids.add(edge_id)
+            errors.append({"path": where, "message": f"{where} 必须是对象"})
+            continue
+        item_ok = True
 
-        src = _clean_identifier(raw.get("from"), f"{where}.from")
-        dst = _clean_identifier(raw.get("to"), f"{where}.to")
-        unknown = [n for n in (src, dst) if n not in node_set]
-        if unknown:
-            raise ValidationError(f"{where} 引用了未定义的节点: {', '.join(unknown)}")
+        edge_id: Optional[str] = None
+        try:
+            edge_id = _clean_identifier(raw.get("edge_id"), f"{where}.edge_id")
+        except ValidationError as exc:
+            errors.append({"path": f"{where}.edge_id", "message": str(exc)})
+            item_ok = False
+        else:
+            if known_edges is not None and edge_id not in known_edges:
+                errors.append(
+                    {"path": f"{where}.edge_id",
+                     "message": f"{where} 引用了不存在的路段: {edge_id!r}"}
+                )
+                item_ok = False
 
-        if "travel_seconds" not in raw:
-            raise ValidationError(f"{where} 缺少 travel_seconds")
-        seconds = _validate_seconds(raw["travel_seconds"])
-        has_stairs = _validate_stairs(raw.get("has_stairs", False))
+        have_start = "start" in raw
+        have_end = "end" in raw
+        if not have_start:
+            errors.append({"path": f"{where}.start", "message": f"{where} 缺少 start"})
+            item_ok = False
+        if not have_end:
+            errors.append({"path": f"{where}.end", "message": f"{where} 缺少 end"})
+            item_ok = False
+        start = end = None
+        if have_start and have_end:
+            try:
+                start = parse_time(raw["start"])
+                end = parse_time(raw["end"])
+            except TimeError as exc:
+                errors.append({"path": where, "message": f"{where}: {exc}"})
+                item_ok = False
+            else:
+                if start >= end:
+                    errors.append(
+                        {"path": where,
+                         "message": f"{where} 无效时间区间: start({raw['start']}) "
+                                    f"必须早于 end({raw['end']})"}
+                    )
+                    item_ok = False
+        if item_ok:
+            closures.append({"edge_id": edge_id, "start": start, "end": end})
 
-        # 反向通行时间窗：缺省（None）与空数组都表示全程仅允许原方向
-        reverse_windows: list[tuple[int, int]] = []
-        if "reverse_windows" in raw and raw["reverse_windows"] is not None:
-            reverse_windows = _normalize_reverse_windows(
-                raw["reverse_windows"], where
-            )
-
-        edges.append(
-            {
-                "id": edge_id,
-                "src": src,
-                "dst": dst,
-                "seconds": seconds,
-                "has_stairs": has_stairs,
-                "reverse_windows": reverse_windows,
-            }
-        )
-
-    # 允许空图；允许自环（正秒数下不会被最短路采用）
-    return {"nodes": nodes, "edges": edges}
+    if errors:
+        return errors, None
+    return [], closures
 
 
 def normalize_closures(payload: Any, known_edges: set[str]) -> list[dict]:
@@ -173,35 +343,86 @@ def normalize_closures(payload: Any, known_edges: set[str]) -> list[dict]:
            "end": "2026-10-05T10:00:00Z"}, ...]}
 
     时间区间为半开 ``[start, end)``，必须满足 ``start < end``。
+    首个校验错误以 :class:`ValidationError` 抛出。
     """
     data = _require_object(payload, "封闭记录")
-    raw_closures = data.get("closures")
-    if not isinstance(raw_closures, list):
-        raise ValidationError("closures 必须是数组")
-
-    closures: list[dict] = []
-    for i, raw in enumerate(raw_closures):
-        if not isinstance(raw, dict):
-            raise ValidationError(f"closures[{i}] 必须是对象")
-        where = f"closures[{i}]"
-        edge_id = _clean_identifier(raw.get("edge_id"), f"{where}.edge_id")
-        if edge_id not in known_edges:
-            raise ValidationError(f"{where} 引用了不存在的路段: {edge_id!r}")
-        if "start" not in raw:
-            raise ValidationError(f"{where} 缺少 start")
-        if "end" not in raw:
-            raise ValidationError(f"{where} 缺少 end")
-        try:
-            start = parse_time(raw["start"])
-            end = parse_time(raw["end"])
-        except TimeError as exc:
-            raise ValidationError(f"{where}: {exc}") from None
-        if start >= end:
-            raise ValidationError(
-                f"{where} 无效时间区间: start({raw['start']}) 必须早于 end({raw['end']})"
-            )
-        closures.append({"edge_id": edge_id, "start": start, "end": end})
+    errors, closures = collect_closure_errors(data.get("closures"), known_edges)
+    if errors:
+        raise ValidationError(errors[0]["message"])
     return closures
+
+
+def precheck_import(payload: Any) -> dict:
+    """联合预检：同时校验候选步道图与封闭记录，返回结构化报告。
+
+    期望格式（``graph`` 同 ``POST /admin/graph`` 负载；``closures`` 为
+    封闭记录数组，也兼容 ``POST /admin/closures`` 的
+    ``{"closures": [...]}`` 负载形式）::
+
+        {"graph": {"nodes": [...], "edges": [...]},
+         "closures": [{"edge_id": "E4", "start": "...", "end": "..."}]}
+
+    校验规则与两个导入接口完全一致（字段、时间区间、节点/路段引用、
+    反向窗重叠）；封闭记录的路段引用以**候选图**的编号集合校验，与
+    库中当前数据无关。候选图无效时，封闭记录的路段引用不可判定，
+    跳过该项检查（不误报），封闭项自身错误照常报告。
+
+    纯内存校验：不触碰数据库，任何结果都不会改变当前数据版本。
+    返回报告::
+
+        {"valid": bool, "graph_valid": bool, "closures_valid": bool,
+         "errors": [{"source": "graph"|"closures", "path": ..., "message": ...}],
+         "counts": {"nodes": n, "edges": n, "closures": n,
+                    "reverse_windows": n}}   # 仅 valid 时存在
+    """
+    if not isinstance(payload, dict):
+        return {
+            "valid": False,
+            "graph_valid": False,
+            "closures_valid": False,
+            "errors": [
+                {"source": "payload", "path": "",
+                 "message": "预检负载必须是 JSON 对象，且包含 graph 与 closures 两个字段"}
+            ],
+        }
+
+    if "graph" in payload:
+        graph_errors, graph = collect_graph_errors(payload["graph"])
+    else:
+        graph_errors, graph = [{"path": "graph", "message": "缺少 graph（候选步道图）"}], None
+
+    if "closures" in payload:
+        raw_closures = payload["closures"]
+        # 兼容 /admin/closures 的负载形式 {"closures": [...]}
+        if isinstance(raw_closures, dict) and "closures" in raw_closures:
+            raw_closures = raw_closures["closures"]
+        # 图有效时用候选图的路段编号校验封闭引用；图无效时引用不可判定，跳过
+        known_edges = {e["id"] for e in graph["edges"]} if graph is not None else None
+        closure_errors, closures = collect_closure_errors(raw_closures, known_edges)
+    else:
+        closure_errors, closures = [
+            {"path": "closures", "message": "缺少 closures（封闭记录）"}
+        ], None
+
+    graph_valid = not graph_errors
+    closures_valid = not closure_errors
+    report = {
+        "valid": graph_valid and closures_valid,
+        "graph_valid": graph_valid,
+        "closures_valid": closures_valid,
+        "errors": [
+            *[{"source": "graph", **e} for e in graph_errors],
+            *[{"source": "closures", **e} for e in closure_errors],
+        ],
+    }
+    if report["valid"]:
+        report["counts"] = {
+            "nodes": len(graph["nodes"]),
+            "edges": len(graph["edges"]),
+            "closures": len(closures),
+            "reverse_windows": sum(len(e["reverse_windows"]) for e in graph["edges"]),
+        }
+    return report
 
 
 def _normalize_stop(raw: Any, index: int, node_set: set[str]) -> dict:

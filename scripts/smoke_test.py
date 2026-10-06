@@ -285,6 +285,55 @@ def main() -> int:
     assert call("GET", "/version")[1]["reverse_windows"] == 0
     print("已恢复无反向窗示例图")
 
+    # 18. 联合预检：候选图 + 封闭记录均合法 → valid=true，计数正确，版本不变
+    pre_before = call("GET", "/version")[1]
+    status, pre = call("POST", "/admin/precheck", {
+        "graph": reverse_graph,  # 候选图（含 2 条反向窗），与库中数据无关
+        "closures": [{"edge_id": "E4",
+                      "start": "2026-10-05T10:00:00Z",
+                      "end": "2026-10-05T11:00:00Z"}],
+    })
+    assert status == 200 and pre["valid"] is True, pre
+    assert pre["counts"] == {"nodes": 5, "edges": 6, "closures": 1,
+                             "reverse_windows": 2}, pre
+    assert pre["errors"] == [], pre
+    print("联合预检通过:", pre["counts"])
+
+    # 19. 图无效时仍报封闭项自身错误，但不误报其路段引用
+    status, pre_bad = call("POST", "/admin/precheck", {
+        "graph": {"nodes": ["A"],
+                  "edges": [{"id": "X1", "from": "A", "to": "GHOST",
+                             "travel_seconds": 10, "has_stairs": False}]},
+        "closures": [
+            {"edge_id": "WHATEVER", "start": "2026-10-05T08:00:00Z",
+             "end": "2026-10-05T09:00:00Z"},
+            {"edge_id": "ALSO_ANY", "start": "2026-10-05T10:00:00Z",
+             "end": "2026-10-05T09:00:00Z"},
+        ],
+    })
+    assert pre_bad["valid"] is False and pre_bad["graph_valid"] is False, pre_bad
+    assert pre_bad["closures_valid"] is False, pre_bad  # closures[1] 自身区间错误
+    msgs = [e["message"] for e in pre_bad["errors"]]
+    assert not any("不存在的路段" in m for m in msgs), pre_bad
+    assert any(e["path"] == "closures[1]" for e in pre_bad["errors"]), pre_bad
+    assert not any(e["path"].startswith("closures[0]") for e in pre_bad["errors"]), pre_bad
+
+    # 20. 图有效时按候选图编号校验封闭引用（与库中当前图无关），版本仍不变
+    status, pre_ref = call("POST", "/admin/precheck", {
+        "graph": {"nodes": ["A", "B"],
+                  "edges": [{"id": "ONLY", "from": "A", "to": "B",
+                             "travel_seconds": 10, "has_stairs": False}]},
+        "closures": [{"edge_id": "E1",
+                      "start": "2026-10-05T08:00:00Z",
+                      "end": "2026-10-05T09:00:00Z"}],
+    })
+    assert pre_ref["graph_valid"] is True and pre_ref["valid"] is False, pre_ref
+    assert any(e["path"] == "closures[0].edge_id" and "不存在的路段" in e["message"]
+               for e in pre_ref["errors"]), pre_ref
+    pre_after = call("GET", "/version")[1]
+    assert pre_before["data_version"] == pre_after["data_version"], (pre_before, pre_after)
+    print("联合预检：错误定位、图无效时引用豁免、候选图引用校验、版本不变 ✔")
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1

@@ -299,6 +299,33 @@ async def plan_meeting(request: Request):
         conn.close()
 
 
+@app.post("/admin/precheck")
+async def precheck_data(request: Request):
+    """联合预检候选步道图与封闭记录。
+
+    按导入规则校验并返回全部可判定错误（含原数组位置）；纯只读，
+    任何结果都不改变当前数据版本。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"error": "invalid_payload", "detail": "请求体必须是合法 JSON"}
+        )
+
+    from .schemas import precheck_import
+
+    report = precheck_import(payload)
+    conn = connect()
+    try:
+        init_db(conn)
+        # 只读回显当前版本，便于调用方核对预检未改变数据
+        report["data_version"] = current_version(conn)
+    finally:
+        conn.close()
+    return report
+
+
 @app.post("/admin/graph")
 async def import_graph(request: Request):
     """原子发布新步道图（校验失败保留旧版本）。"""
