@@ -6,7 +6,9 @@
 **反向通行时间窗**数组：窗内仅允许从原终点走向原起点，窗外仅允许原方向，
 方向按进入路段的时刻判定，封闭记录对两个方向同样全程生效。支持在查询中
 指定**按顺序停靠的站点**（每站带开始停留时间窗与停留秒数），见第 4.1 节；
-也支持为**多名访客**在候选节点中选择公共汇合点，见第 4.2 节。
+也支持为**多名访客**在候选节点中选择公共汇合点，见第 4.2 节。导入前可用
+**联合预检**接口一次性校验候选步道图与封闭记录（含反向通行窗），返回
+全部可判定错误且不改动当前数据，见第 4.3 节。
 
 - 语言/存储：Python 3.11 + SQLite（标准库，无需外部数据库）
 - Web 框架：FastAPI + Uvicorn
@@ -365,6 +367,67 @@ python -m app.cli serve
 | 没有任何候选点能让全员在最晚时刻前抵达（含某人不可达/避台阶后不可达） | `404` | `no_meeting_candidate` |
 | 尚未导入步道图（空图） | `503` | `no_data` |
 
+### 4.3 联合预检（`POST /admin/precheck`）
+
+导入前对**候选步道图 + 候选封闭记录**做一次联合校验。校验规则与
+`POST /admin/graph`、`POST /admin/closures` 完全一致（字段、时间区间、
+节点与路段引用、反向窗重叠），区别在于：
+
+- 一次请求同时提交两类输入，封闭记录的路段引用按**本次提交的候选图**
+  的路段编号校验（与库中当前版本无关）；
+- 返回**全部**可判定错误及其在原数组中的位置，而不是只报第一个；
+- 候选图自身无效时，封闭记录的路段引用不可判定——**跳过**引用校验
+  （不误报），封闭记录自身的字段/时间区间错误仍照常报告；
+- **只读**：无论结果如何都不改变当前数据版本。
+
+请求：
+
+```json
+{
+  "graph":    {"nodes": ["..."], "edges": ["... 同 /admin/graph 负载 ..."]},
+  "closures": {"closures": ["... 同 /admin/closures 负载 ..."]}
+}
+```
+
+响应（HTTP `200`）：
+
+```json
+{
+  "ok": false,
+  "errors": [
+    {"source": "graph", "path": "edges[1].travel_seconds", "index": 1,
+     "message": "通行秒数(travel_seconds)必须为正数，收到 0"},
+    {"source": "closures", "path": "closures[0].edge_id", "index": 0,
+     "message": "closures[0] 引用了不存在的路段: 'E9'"}
+  ],
+  "data_version": 2
+}
+```
+
+- `source`：`graph` 或 `closures`，标明错误来自哪类输入；
+- `path`：错误位置（相对该类输入的负载），方括号内即原数组下标；
+- `index`：`path` 中最内层数组元素的下标，无对应数组元素时为 `null`；
+- `message`：与导入接口一致的错误描述；
+- `data_version`：当前生效的数据版本，预检不会改动它。
+
+预检通过时返回候选数据的节点、路段、封闭记录与反向时间窗条数：
+
+```json
+{
+  "ok": true,
+  "errors": [],
+  "counts": {"nodes": 5, "edges": 6, "closures": 1, "reverse_windows": 2},
+  "data_version": 2
+}
+```
+
+错误映射：
+
+| 场景 | 状态码 | `error` |
+| --- | --- | --- |
+| 候选数据未通过校验（响应体含全部错误明细） | `200` | —（`ok: false`） |
+| 请求包络非法（非 JSON 对象、缺少 `graph`/`closures`） | `400` | `invalid_payload` |
+
 ### `POST /admin/graph` — 原子发布新步道图
 
 ```bash
@@ -495,7 +558,34 @@ curl -s -X POST http://localhost:8080/admin/graph \
           {"start":"2026-10-05T11:00:00Z","end":"2026-10-05T12:30:00Z"},
           {"start":"2026-10-05T12:00:00Z","end":"2026-10-05T13:00:00Z"}]}]}'
 
-# 冒烟自检（需服务已启动；内含反向窗导入/拒绝与窗内通行检查）
+# 联合预检：候选图 + 封闭记录一次校验（只读，不改动当前版本）
+curl -s -X POST http://localhost:8080/admin/precheck \
+  -H 'Content-Type: application/json' \
+  -d '{"graph":{"nodes":["A","B"],"edges":[
+         {"id":"E1","from":"A","to":"B","travel_seconds":60,"has_stairs":false,
+          "reverse_windows":[
+            {"start":"2026-10-05T11:00:00Z","end":"2026-10-05T12:00:00Z"}]}]},
+       "closures":{"closures":[
+         {"edge_id":"E1","start":"2026-10-05T08:00:00Z","end":"2026-10-05T09:00:00Z"}]}}'
+# → {"ok":true,"errors":[],
+#    "counts":{"nodes":2,"edges":1,"closures":1,"reverse_windows":1},
+#    "data_version":...}
+
+# 预检失败：一次返回全部可判定错误及原数组位置；
+# 图无效时 E9 的路段引用不误报，但封闭项自身 start>=end 的错误仍报告
+curl -s -X POST http://localhost:8080/admin/precheck \
+  -H 'Content-Type: application/json' \
+  -d '{"graph":{"nodes":["A"],"edges":[
+         {"id":"E1","from":"A","to":"GHOST","travel_seconds":0,"has_stairs":false}]},
+       "closures":{"closures":[
+         {"edge_id":"E9","start":"2026-10-05T09:00:00Z","end":"2026-10-05T08:00:00Z"}]}}'
+# → {"ok":false,"errors":[
+#      {"source":"graph","path":"edges[0].to","index":0,"message":"...未定义的节点: GHOST"},
+#      {"source":"graph","path":"edges[0].travel_seconds","index":0,"message":"...必须为正数..."},
+#      {"source":"closures","path":"closures[0]","index":0,"message":"...无效时间区间..."}],
+#    "data_version":...}
+
+# 冒烟自检（需服务已启动；内含反向窗导入/拒绝、窗内通行与联合预检检查）
 python3 scripts/smoke_test.py http://localhost:8080
 ```
 
@@ -570,6 +660,42 @@ with urllib.request.urlopen(req) as resp:
 print(route["arrival_time"], route["edge_sequence"])
 ```
 
+联合预检 Python 示例：
+
+```python
+import json, urllib.request
+
+req = urllib.request.Request(
+    "http://localhost:8080/admin/precheck",
+    data=json.dumps({
+        "graph": {
+            "nodes": ["A", "B"],
+            "edges": [
+                {"id": "E1", "from": "A", "to": "B",
+                 "travel_seconds": 60, "has_stairs": False,
+                 "reverse_windows": [
+                     {"start": "2026-10-05T11:00:00Z",
+                      "end": "2026-10-05T12:00:00Z"}]},
+            ],
+        },
+        "closures": {
+            "closures": [
+                {"edge_id": "E1",
+                 "start": "2026-10-05T08:00:00Z",
+                 "end": "2026-10-05T09:00:00Z"}],
+        },
+    }).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req) as resp:
+    report = json.load(resp)
+if report["ok"]:
+    print("预检通过:", report["counts"])
+else:
+    for err in report["errors"]:
+        print(err["source"], err["path"], err["message"])
+```
+
 ---
 
 ## 6. 选路与版本语义
@@ -614,6 +740,7 @@ app/
   config.py        # 环境变量配置
   timeutil.py      # ISO 8601 <-> 纪元秒（UTC）
   schemas.py       # 导入/查询负载校验（含停靠点 stops、多人汇合 meeting、反向窗）
+  precheck.py      # 联合预检：候选图+封闭记录只读批量校验（收集全部错误及位置）
   db.py            # SQLite 版本化与原子发布
   routing.py       # 时间依赖最短路 + 字典序选路引擎（含按顺序停靠、多人汇合、反向窗）
   main.py          # FastAPI 路由
@@ -621,7 +748,7 @@ app/
   cli.py           # init-db / import-* / serve
 data/              # 示例 JSON 与本地数据库
 scripts/smoke_test.py
-tests/             # 标准库 unittest 测试（121 个用例）
+tests/             # 标准库 unittest 测试（136 个用例）
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh
@@ -641,4 +768,6 @@ python3 -m unittest discover -s tests -v
 封闭对两方向的全程约束、等窗/等封闭、多窗相接与等待下一窗、
 避台阶、与停靠/汇合/字典序平局的组合、逐段实际方向、
 无效/重叠窗拒绝整次导入并保留旧版本、版本快照与复制）、
+联合预检（全部错误收集与原数组位置、候选图交叉校验封闭引用、
+图无效时封闭引用不误报、通过时计数、预检不改变数据版本）、
 无路线、原子发布回滚与版本快照等场景。

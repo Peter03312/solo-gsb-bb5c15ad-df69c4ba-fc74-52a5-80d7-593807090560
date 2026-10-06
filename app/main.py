@@ -1,4 +1,4 @@
-"""FastAPI 应用：查询与原子导入 HTTP API。"""
+"""FastAPI 应用：查询、原子导入与联合预检 HTTP API。"""
 from __future__ import annotations
 
 import json
@@ -17,6 +17,7 @@ from .db import (
     publish_closures,
     publish_graph,
 )
+from .precheck import precheck as run_precheck
 from .routing import (
     MeetingVisitor,
     NoMeetingCandidateError,
@@ -329,6 +330,32 @@ async def import_graph(request: Request):
             "data_version": new_version,
             "previous_version": old_version,
         }
+    finally:
+        conn.close()
+
+
+@app.post("/admin/precheck")
+async def precheck_data(request: Request):
+    """联合预检候选步道图与封闭记录（只读，不改变当前数据版本）。"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"error": "invalid_payload", "detail": "请求体必须是合法 JSON"}
+        )
+    conn = connect()
+    try:
+        init_db(conn)
+        try:
+            report = run_precheck(payload)
+        except PayloadValidationError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_payload", "detail": str(exc)},
+            )
+        # 只读接口：附上当前版本号，便于调用方确认预检未改动数据
+        report["data_version"] = current_version(conn)
+        return report
     finally:
         conn.close()
 

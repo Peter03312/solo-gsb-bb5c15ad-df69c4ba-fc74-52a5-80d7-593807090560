@@ -285,6 +285,66 @@ def main() -> int:
     assert call("GET", "/version")[1]["reverse_windows"] == 0
     print("已恢复无反向窗示例图")
 
+    # 18. 联合预检：候选图 + 封闭记录一次校验，只读不改变当前版本
+    version_before = call("GET", "/version")[1]
+    ok_precheck = {
+        "graph": {
+            "nodes": ["N1", "N2", "N3"],
+            "edges": [
+                {"id": "A1", "from": "N1", "to": "N2", "travel_seconds": 60, "has_stairs": False},
+                {"id": "A2", "from": "N2", "to": "N3", "travel_seconds": 90, "has_stairs": True,
+                 "reverse_windows": [
+                     {"start": "2026-10-05T11:00:00Z", "end": "2026-10-05T12:00:00Z"},
+                     {"start": "2026-10-05T13:00:00Z", "end": "2026-10-05T14:00:00Z"}]},
+            ],
+        },
+        "closures": {"closures": [
+            {"edge_id": "A1", "start": "2026-10-05T08:00:00Z", "end": "2026-10-05T09:00:00Z"}]},
+    }
+    status, pre = call("POST", "/admin/precheck", ok_precheck)
+    assert status == 200 and pre["ok"] is True and pre["errors"] == [], pre
+    assert pre["counts"] == {"nodes": 3, "edges": 2, "closures": 1, "reverse_windows": 2}, pre
+    assert pre["data_version"] == version_before["data_version"], pre
+    print("联合预检通过:", pre["counts"])
+
+    # 候选图有效时，封闭记录按候选图的路段编号校验（与库中版本无关）
+    status, pre_ref = call("POST", "/admin/precheck", {
+        "graph": ok_precheck["graph"],
+        "closures": {"closures": [
+            {"edge_id": "ZZ", "start": "2026-10-05T08:00:00Z", "end": "2026-10-05T09:00:00Z"}]},
+    })
+    assert pre_ref["ok"] is False, pre_ref
+    assert [(e["source"], e["path"], e["index"]) for e in pre_ref["errors"]] == [
+        ("closures", "closures[0].edge_id", 0)], pre_ref
+
+    # 候选图无效：封闭记录的路段引用不误报，自身错误仍报告；版本不变
+    status, pre_bad = call("POST", "/admin/precheck", {
+        "graph": {
+            "nodes": ["N1", "N2"],
+            "edges": [
+                {"id": "A1", "from": "N1", "to": "GHOST",
+                 "travel_seconds": 0, "has_stairs": False},
+            ],
+        },
+        "closures": {"closures": [
+            {"edge_id": "A1", "start": "2026-10-05T09:00:00Z", "end": "2026-10-05T08:00:00Z"},
+            {"edge_id": "UNKNOWN", "start": "2026-10-05T08:00:00Z", "end": "2026-10-05T09:00:00Z"},
+        ]},
+    })
+    assert status == 200 and pre_bad["ok"] is False, pre_bad
+    paths = {(e["source"], e["path"]) for e in pre_bad["errors"]}
+    assert ("graph", "edges[0].to") in paths, pre_bad
+    assert ("graph", "edges[0].travel_seconds") in paths, pre_bad
+    assert ("closures", "closures[0]") in paths, pre_bad  # 自身时间区间错误
+    assert ("closures", "closures[1].edge_id") not in paths, pre_bad  # 图无效→不误报引用
+    assert call("GET", "/version")[1]["data_version"] == version_before["data_version"]
+    print("联合预检失败: 收集全部错误且不改动版本 ✔")
+
+    # 预检包络非法（缺 closures）→ 400
+    status, pre_env = call("POST", "/admin/precheck",
+                           {"graph": ok_precheck["graph"]}, expect_status=400)
+    assert pre_env["error"] == "invalid_payload", pre_env
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1
